@@ -1,0 +1,8 @@
+# dsh-big-fish-speak bundle patch.
+#
+# 一行 insert 即挂载 Host 半身（命令注册在 index.js 的 apply 里完成）。
+# name 必须与安装时解析到的包名一致，否则启动时会报 ERR_MODULE_NOT_FOUND。
+- insert:
+    - id: big-fish-speak
+      name: 'dsh-big-fish-speak'
+      config: {}

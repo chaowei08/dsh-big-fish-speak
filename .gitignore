@@ -1,0 +1,6 @@
+# 本地运行时产物（不进仓库）
+settings.json
+*.tgz
+node_modules/
+package.json.bak-*
+_*_backup_*

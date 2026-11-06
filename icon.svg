@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <title>大肥鱼语音播报</title>
+  <path d="M8 32c10-13 26-15 34-7 2 2 3 5 3 7 0 2-1 5-3 7-8 8-24 6-34-7z" fill="#2b7fff"/>
+  <circle cx="20" cy="28" r="3" fill="#ffffff"/>
+  <circle cx="21" cy="28" r="1.4" fill="#0b2b55"/>
+  <path d="M46 24c4 2 6 5 6 8s-2 6-6 8" fill="none" stroke="#2b7fff" stroke-width="3" stroke-linecap="round"/>
+  <path d="M52 19c5 3 8 8 8 13s-3 10-8 13" fill="none" stroke="#2b7fff" stroke-width="3" stroke-linecap="round" opacity="0.55"/>
+</svg>
