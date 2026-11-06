@@ -1,6 +1,6 @@
 Name: dsh-big-fish-speak
 
-Live: 桌宠音色版（0.7.1）
+Live: 桌宠音色版（0.7.2）
 
 方法：不再自己合成音频，直接调 dsh-pet 的本地广播接口
   POST http://127.0.0.1:<webServer 端口>/dsh-pet-7340/broadcast?pet=<id>&surface=<desktop|web>
@@ -55,3 +55,10 @@ config（cordis.patch.yml 里可空，一般不用填）：
 
 依赖：dsh-pet（0.4.x）。桌宠不在或没加载完时，命令会明确报「找不到桌宠服务地址」。
 不再需要 speak.ps1，也不需要 PowerShell / SAPI / WinRT。
+
+免责与归属：
+  非官方插件，与 DeepSeek Harness、dsh-pet（github.com/PC2005-cloud/dsh-pet，MIT）的作者
+  均无隶属关系，也未经其背书。本插件只调用 dsh-pet 的本机接口，不含其任何源代码或素材。
+  语音合成由 dsh-pet 完成（其使用 Edge TTS 免费接口），本插件不自带语音服务，
+  不收集、不上传任何数据；只在本机读取桌宠的 logs.txt 用于确认是否真的出声。
+  「大肥鱼」是本插件使用者的桌宠昵称，与任何第三方角色或商标无关。
