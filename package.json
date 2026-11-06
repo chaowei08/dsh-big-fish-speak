@@ -5,6 +5,15 @@
   "type": "module",
   "main": "./index.js",
   "license": "MIT",
+  "author": "Chaowei",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chaowei08/dsh-big-fish-speak.git"
+  },
+  "homepage": "https://github.com/chaowei08/dsh-big-fish-speak#readme",
+  "bugs": {
+    "url": "https://github.com/chaowei08/dsh-big-fish-speak/issues"
+  },
   "keywords": ["dsh", "dsh-plugin", "tts", "speech", "big-fish", "dsh-pet"],
   "files": ["index.js", "cordis.patch.yml", "README.md", "icon.svg"],
   "exports": {
