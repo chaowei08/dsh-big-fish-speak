@@ -1,6 +1,6 @@
 {
   "name": "dsh-big-fish-speak",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "大肥鱼语音播报（桌宠音色版）：模型一有输出就让 dsh-pet 用它自己的音色念出来，按标点切句、按实测语速衔接、逐段回读日志确认真的出声、不设段数上限。",
   "type": "module",
   "main": "./index.js",
