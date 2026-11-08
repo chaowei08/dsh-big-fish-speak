@@ -8,8 +8,11 @@
  * 插件这一侧不产生任何本地脚本、不联网、不需要 API Key。
  *
  * 自动播报：监听 `session/event` 的 `assistant/message`，模型一有输出就让大肥鱼念。
- * 默认念**全文**、不设段数上限；长回答按标点切成 ≤60 字的小句，
- * 段间按实测语速（约 0.23 秒/字）衔接，听起来是连着一口气念下来的。
+ * 默认念**全文**、不设段数上限，**整段一次送出去**：桌宠客户端原来的 60 字单句上限
+ * 已由上游（dsh-pet 0.4.6）移除，插件不再按 60 字切句；只有超过单次请求上限
+ * （宿主 /voice/speak 限制 500 字）的长文本才按标点切成大块。
+ * 旧版桌宠（≤0.4.5）仍有 60 字截断，插件会按安装的版本自动切 60 字，
+ * 运行时发现正文被截断也会即时降级。段间按实测语速（约 0.23 秒/字）衔接。
  * 每段送出去后回读桌宠日志确认真的出声（Edge TTS 429 限流会让它静默丢句），失败退避重发。
  * 手动命令：
  *   /speak <文本>        让大肥鱼念这段话（默认念全文）
@@ -17,8 +20,8 @@
  *   /voice test          试听一句
  *   /voice auto on|off   开关"模型输出自动播报"
  *
- * 已知边界：桌宠客户端的单句念白上限是 60 字（VOICE_SPEECH_MAX_CHARS），
- * 超过的部分不会念；插件按句号/逗号把它切成多段依次送出，尽量念完。
+ * 地址发现：直接读宿主注入的 `ctx.webServer` 端口（未监听时是 0，会退回日志里的地址），
+ * 不再靠扒桌宠日志里的端口；日志只用来确认某一段到底念出来没有。
  *
  * @module dsh-big-fish-speak
  */
@@ -31,8 +34,8 @@ import http from 'node:http'
 /** Cordis 插件名。 */
 export const name = 'big-fish-speak'
 
-/** 命令注册需要 commands 服务；没有它的组合不会激活本插件。 */
-export const inject = ['commands']
+/** 命令注册需要 commands 服务；webServer 用来拿桌宠接口的真实地址。 */
+export const inject = ['commands', 'webServer']
 
 const DATA_DIR = path.join(os.homedir(), '.dsh', 'big-fish-speak')
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json')
@@ -43,12 +46,68 @@ const PET_LOG_FILE = path.join(PET_ROOT, 'logs.txt')
 /** 桌宠注册在 DSH webServer 上的路由前缀（dsh-pet/src/host/route-segment）。 */
 const PET_SEGMENT = '/dsh-pet-7340'
 
-/** 桌宠客户端单句念白上限，超过会被它自己截断。 */
-const PET_SPEECH_MAX_CHARS = 60
+/**
+ * 桌宠单次念白的字数上限：
+ * - v0.4.6 起作者取消了客户端 60 字截断（commit e6b0a650 fix(voice)），长文本可以整段送；
+ * - 但宿主侧 /voice/speak 仍限制单次 ≤ MAX_TEXT_CHARS=500 字，超了直接回 text too long。
+ * 所以「整段下发」的实际天花板是 500 字；旧版（≤0.4.5）客户端还会把正文截到 60 字，
+ * 这时按 60 字切，运行时若发现被截断也会自动降级。
+ */
+const MODERN_CAP_CHARS = 500
+const LEGACY_CAP_CHARS = 60
+const LEGACY_VERSION = '0.4.6'
+
+/** 运行时发现过"被截断"就锁定旧版行为，后面的长句不再白送一遍。 */
+let legacyCapDetected = false
+
+/** 读各 profile 里装的 dsh-pet 版本号；读不到返回空数组。 */
+function installedPetVersions() {
+  const found = []
+  try {
+    const profiles = path.join(os.homedir(), '.dsh', 'profiles')
+    for (const entry of fs.readdirSync(profiles, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue
+      const file = path.join(profiles, entry.name, 'node_modules', 'dsh-pet', 'package.json')
+      try {
+        const version = JSON.parse(fs.readFileSync(file, 'utf8'))?.version
+        if (typeof version === 'string' && version !== '') found.push(version)
+      } catch {
+        // 这个 profile 没装桌宠，跳过
+      }
+    }
+  } catch {
+    // 没有 profiles 目录
+  }
+  return found
+}
+
+/** 简易版本比较：a < b 返回负数。 */
+function compareVersion(a, b) {
+  const pa = String(a).split('.').map((n) => Number.parseInt(n, 10) || 0)
+  const pb = String(b).split('.').map((n) => Number.parseInt(n, 10) || 0)
+  for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
+    const diff = (pa[i] ?? 0) - (pb[i] ?? 0)
+    if (diff !== 0) return diff
+  }
+  return 0
+}
+
+/**
+ * 当前每段最多送多少字：任一 profile 里还是旧版桌宠就按 60 字走。
+ * 读不到版本时按新版走，靠运行时截断检测兜底。
+ */
+export function charLimit() {
+  if (legacyCapDetected) return LEGACY_CAP_CHARS
+  const versions = installedPetVersions()
+  if (versions.length === 0) return MODERN_CAP_CHARS
+  return versions.every((version) => compareVersion(version, LEGACY_VERSION) >= 0)
+    ? MODERN_CAP_CHARS
+    : LEGACY_CAP_CHARS
+}
 
 /**
  * 不设段数上限：长回答能念多长就念多长。这里只是一个防止死循环的极端保护
- * （200 段 ≈ 12000 字），正常输出永远碰不到。
+ * （200 段 ≈ 12000 字以上），正常输出永远碰不到。
  */
 const MAX_HARD_CHUNKS = 200
 
@@ -74,6 +133,15 @@ const VERIFY_POLL_MS = 500
 const VERIFY_TIMEOUT_MS = 16_000
 const VERIFY_ATTEMPTS = 3
 const VERIFY_RETRY_WAIT_MS = 3500
+
+/**
+ * 逐段验收的等待上限随字数放大：整段下发时一段可能有上千字，
+ * 合成要几十秒，不能用固定 16 秒去判"没念出来"。
+ */
+function verifyTimeoutMs(len) {
+  const scaled = VERIFY_TIMEOUT_MS + Math.round(len * 45)
+  return Math.min(180_000, Math.max(VERIFY_TIMEOUT_MS, scaled))
+}
 
 /** 桌宠内置音色的中文名（来自 dsh-pet 的 VOICES 表）。 */
 const VOICE_LABELS = {
@@ -176,27 +244,32 @@ function voiceLabel(voiceId) {
 }
 
 /**
- * 找桌宠服务地址：优先用宿主 webServer 的端口，拿不到就回读桌宠日志里
- * `desktop helper started (config: http://127.0.0.1:<port>/dsh-pet-7340/config)` 那一行。
+ * 找桌宠服务地址：桌宠把路由挂在宿主自己的 webServer 上，所以直接读 `ctx.webServer`
+ * 的 origin / port 就是最准的地址（桌宠作者也建议这么读，不必去摸端口）。
+ * 端口还没监听时是 0，这时才退回桌宠日志里那一行 `desktop helper started (config: ...)`
+ * 作兜底；两者都拿不到就当作"找不到服务"。
  */
 function resolveOrigin(ctx) {
-  // 宿主用 Proxy 追踪服务访问：没在 inject 里声明 webServer 时读 ctx.webServer 会直接抛错，
-  // 所以这里必须 try 包住，拿不到就退回日志里的端口。
-  let direct
+  let origin
   try {
-    direct = ctx?.webServer?.port
-  } catch {
-    direct = undefined
-  }
-  if (!Number.isFinite(direct)) {
-    try {
-      const viaGet = typeof ctx?.get === 'function' ? ctx.get('webServer') : undefined
-      direct = viaGet?.port ?? undefined
-    } catch {
-      direct = undefined
+    const getOrigin = ctx?.webServer?.getOrigin
+    if (typeof getOrigin === 'function') {
+      const viaOrigin = String(getOrigin.call(ctx.webServer) ?? '').trim()
+      if (viaOrigin !== '') origin = viaOrigin
     }
+  } catch {
+    origin = undefined
   }
-  if (Number.isFinite(direct) && direct > 0) return `http://127.0.0.1:${direct}`
+  if (origin === undefined) {
+    let port
+    try {
+      port = ctx?.webServer?.port
+    } catch {
+      port = undefined
+    }
+    if (Number.isFinite(port) && port > 0) origin = `http://127.0.0.1:${port}`
+  }
+  if (origin !== undefined) return origin.replace(/\/+$/, '')
   try {
     const tail = fs.readFileSync(PET_LOG_FILE, 'utf8').split('\n').slice(-400).join('\n')
     const hits = [...tail.matchAll(/http:\/\/127\.0\.0\.1:(\d+)\/dsh-pet-7340/g)]
@@ -340,7 +413,7 @@ async function warmVoice(ctx, text) {
 /**
  * 切一段不超过 limit 的文本，尽量断在标点上：
  * 优先断在句末（。！？；…换行），让每次念出去的都是一句完整的话；
- * 一句装不下 60 字时再退到句读（，、：等）；实在没有标点才硬切。
+ * 一句装不下 limit 时再退到句读（，、：等）；实在没有标点才硬切。
  * 只有断点足够靠后（≥ limit/3）才采用，避免切出两三个字的碎段。
  */
 function cutOne(text, limit) {
@@ -365,11 +438,12 @@ function cutOne(text, limit) {
 }
 
 /**
- * 按桌宠单句上限把长文本切成若干段。
+ * 把长文本按 limit 切成若干段。新版桌宠取消 60 字上限后，limit 默认就是「整段送」的
+ * 500 字上限；旧版桌宠由调用方传 60，超长文本才会真正被切成多段。
  * maxChunks 传 0（默认）= 不设段数上限，只受 MAX_HARD_CHUNKS 极端保护；
  * 还剩多少字用 restChars 回报（正常情况恒为 0）。
  */
-export function chunkText(text, limit = PET_SPEECH_MAX_CHARS, maxChunks = 0) {
+export function chunkText(text, limit = MODERN_CAP_CHARS, maxChunks = 0) {
   let rest = String(text ?? '').trim()
   const out = []
   const cap = maxChunks > 0 ? Math.min(maxChunks, MAX_HARD_CHUNKS) : MAX_HARD_CHUNKS
@@ -435,54 +509,84 @@ async function broadcastWithRetry(ctx, text) {
 }
 
 /**
- * 回读桌宠日志，找出"字数等于 len"的 voice speak 记录。
+ * 读出桌宠日志里所有 `voice speak:` 记录（字数 + 是否失败）。
  * 只用来判断"这一段到底念出来没有"，读不到日志就当作未知（放行）。
  */
-function speakLinesOf(len) {
+function speakRecords() {
+  const out = []
   try {
-    const needle = 'voice speak:'
-    const charTag = `chars=${len} `
-    return fs
-      .readFileSync(PET_LOG_FILE, 'utf8')
-      .split('\n')
-      .filter((line) => line.includes(needle) && line.includes(charTag))
+    for (const line of fs.readFileSync(PET_LOG_FILE, 'utf8').split('\n')) {
+      const at = line.indexOf('voice speak:')
+      if (at < 0) continue
+      const chars = /chars=(\d+)/.exec(line.slice(at))
+      if (chars === null) continue
+      out.push({
+        chars: Number(chars[1]),
+        failed: /failed|dropped|queue full/i.test(line.slice(at)),
+      })
+    }
   } catch {
-    return []
+    // 读不到日志 = 没有证据，按"已送出"处理
   }
+  return out
 }
 
-/** 等桌宠把这段合成完（日志里多一行）；返回 ok / failed / unknown。 */
+/**
+ * 等桌宠把这段合成完（日志里多一条记录）：
+ * - 出现 chars 正好等于发送字数的记录 → ok / failed
+ * - 发的是长句，却只多出一条被截到 60 字的记录 → 老版本客户端截断了，回报实际念出的字数
+ * - 等到上限还没有对应记录 → unknown（读不到日志，按已送出处理）
+ */
 async function waitSpeakVerdict(len, countBefore) {
-  const deadline = Date.now() + VERIFY_TIMEOUT_MS
+  const deadline = Date.now() + verifyTimeoutMs(len)
+  // 给"正好等于发送字数"的记录留一点宽限，别把并发的预热记录误判成截断
+  const truncateGraceMs = 2500
+  let slicedAt = 0
   while (Date.now() < deadline) {
-    const lines = speakLinesOf(len)
-    if (lines.length > countBefore) {
-      const last = lines[lines.length - 1]
-      return last.includes('failed') ? 'failed' : 'ok'
+    const fresh = speakRecords().slice(countBefore)
+    const exact = fresh.find((record) => record.chars === len)
+    if (exact !== undefined) {
+      return { verdict: exact.failed ? 'failed' : 'ok', heardChars: len }
+    }
+    if (len > LEGACY_CAP_CHARS) {
+      const sliced = fresh.find((record) => record.chars === LEGACY_CAP_CHARS && !record.failed)
+      if (sliced !== undefined) {
+        if (slicedAt === 0) slicedAt = Date.now()
+        if (Date.now() - slicedAt >= truncateGraceMs) {
+          return { verdict: 'truncated', heardChars: LEGACY_CAP_CHARS }
+        }
+      }
     }
     await sleep(VERIFY_POLL_MS)
   }
-  return 'unknown'
+  return { verdict: 'unknown', heardChars: 0 }
 }
 
 /**
  * 送一段并确认桌宠真的念出来了：
  * broadcast 只代表"收到了"，Edge TTS 429 / 超时会只写一行 failed 就静默丢掉，
  * 所以这里比对日志，失败就退避重发，最多 VERIFY_ATTEMPTS 次。
- * 返回 { ok, elapsed }：elapsed 是这次送达到"开始出声"之间花掉的时间，用来算下一段该等多久。
+ * 返回 { ok, truncated, heardChars, elapsed }：truncated 表示老版本桌宠只念了前 60 字。
  */
 async function sendWithVerify(ctx, text) {
   const len = text.length
   for (let attempt = 0; attempt < VERIFY_ATTEMPTS; attempt += 1) {
-    const countBefore = speakLinesOf(len).length
+    const countBefore = speakRecords().length
     await broadcastWithRetry(ctx, text)
-    const verdict = await waitSpeakVerdict(len, countBefore)
+    const { verdict, heardChars } = await waitSpeakVerdict(len, countBefore)
+    if (verdict === 'truncated') {
+      // 记下来：后面的长句直接按 60 字切，不再白送一遍
+      legacyCapDetected = true
+      return { ok: false, truncated: true, heardChars, elapsed: 0, attempt: attempt + 1 }
+    }
     // 日志那一行写出时，这段音频刚好开始播：计时零点落在这里。
     // 若用"发送时刻"算已播时间，会把合成等待误算进去，下一段就会顶上来叠着念。
-    if (verdict !== 'failed') return { ok: verdict === 'ok', elapsed: 0, attempt: attempt + 1 }
+    if (verdict !== 'failed') {
+      return { ok: verdict === 'ok', truncated: false, heardChars: 0, elapsed: 0, attempt: attempt + 1 }
+    }
     if (attempt < VERIFY_ATTEMPTS - 1) await sleep(VERIFY_RETRY_WAIT_MS * (attempt + 1))
   }
-  return { ok: false, elapsed: 0, attempts: VERIFY_ATTEMPTS }
+  return { ok: false, truncated: false, heardChars: 0, elapsed: 0, attempts: VERIFY_ATTEMPTS }
 }
 
 /**
@@ -494,31 +598,44 @@ async function sendWithVerify(ctx, text) {
 async function runChunks(ctx, chunks, startIndex = 0, lead = null) {
   let spoken = 0
   const dropped = []
+  // 运行中可能重新切分，所以用可变队列
+  const queue = chunks.slice(startIndex)
   // lead：调用方已经先送出去的那一段（及它花掉的合成时间），先按它的时长等够再续念
-  if (lead && startIndex < chunks.length) {
-    void warmVoice(ctx, chunks[startIndex])
+  if (lead && queue.length > 0) {
+    void warmVoice(ctx, queue[0])
     const targetMs = Math.round(lead.chars * MS_PER_CHAR) + BETWEEN_GAP_MS
     await sleep(Math.max(MIN_GAP_MS, targetMs - lead.elapsed))
   }
-  for (let i = startIndex; i < chunks.length; i += 1) {
+  for (let i = 0; i < queue.length; i += 1) {
     let elapsed = 0
+    const piece = queue[i]
     try {
-      const res = await sendWithVerify(ctx, chunks[i])
+      const res = await sendWithVerify(ctx, piece)
       elapsed = res.elapsed
+      if (res.truncated) {
+        // 老版本只念了开头 heardChars 个字：剩下的按 60 字切好，插到当前位置接着念
+        const rest = piece.slice(res.heardChars).trim()
+        const sub = rest === '' ? [] : chunkText(rest, LEGACY_CAP_CHARS, 0).chunks
+        if (sub.length > 0) {
+          queue.splice(i, 1, ...sub)
+          i -= 1
+          continue
+        }
+      }
       if (res.ok) spoken += 1
       else dropped.push(i + 1)
     } catch (error) {
       const wrapped = new Error(
-        `第 ${i + 1}/${chunks.length} 段没送出去：${String(error?.message ?? error).split('\n')[0]}`,
+        `第 ${i + 1}/${queue.length} 段没送出去：${String(error?.message ?? error).split('\n')[0]}`,
       )
       wrapped.spoken = spoken
       wrapped.dropped = dropped
       throw wrapped
     }
-    if (i < chunks.length - 1) {
+    if (i < queue.length - 1) {
       // 这段还在播的时候，先把下一段合成进缓存，下一段就能立刻接上
-      void warmVoice(ctx, chunks[i + 1])
-      const targetMs = Math.round(chunks[i].length * MS_PER_CHAR) + BETWEEN_GAP_MS
+      void warmVoice(ctx, queue[i + 1])
+      const targetMs = Math.round(piece.length * MS_PER_CHAR) + BETWEEN_GAP_MS
       await sleep(Math.max(MIN_GAP_MS, targetMs - elapsed))
     }
   }
@@ -526,7 +643,8 @@ async function runChunks(ctx, chunks, startIndex = 0, lead = null) {
 }
 
 /**
- * 念一段可能超过 60 字的文本：分段后按预估时长错开送出，让桌宠连着念。
+ * 念一段文本：新版桌宠下整段一次送出（只受 500 字单请求上限约束），
+ * 超过当前上限才分段并按预估时长错开送出，让桌宠连着念。
  * maxChunks 传 0 表示念全文（调用方负责卡安全上限）。
  */
 async function speakChunks(ctx, text, limit, maxChunks) {
@@ -584,9 +702,11 @@ export function apply(ctx, config = {}) {
         const spoken = toSpeakable(assistantTextOf(event))
         if (spoken === '') return
 
+        // 新版桌宠整段下发（≤500 字）；maxChars 只能把单段改小，不能超过当前上限
+        const cap = charLimit()
         const limit = Number.isFinite(config?.maxChars) && config.maxChars > 0
-          ? Math.min(PET_SPEECH_MAX_CHARS, config.maxChars)
-          : PET_SPEECH_MAX_CHARS
+          ? Math.min(cap, Math.round(config.maxChars))
+          : cap
         // 默认念全文，不设段数上限（只受 MAX_HARD_CHUNKS 极端保护）
         const autoChunks = Number.isFinite(config?.autoChunks) && config.autoChunks > 0
           ? Math.min(MAX_HARD_CHUNKS, Math.round(config.autoChunks))
@@ -633,7 +753,7 @@ export function apply(ctx, config = {}) {
         // 先切段，再把第一段真的送出去：一段都发不出去才算失败，剩下的在后台接着念
         let plan
         try {
-          plan = chunkText(raw, PET_SPEECH_MAX_CHARS, maxChunks)
+          plan = chunkText(raw, charLimit(), maxChunks)
         } catch (error) {
           return { kind: 'error', text: `播报失败：${String(error?.message ?? error).split('\n')[0]}` }
         }
@@ -697,7 +817,7 @@ export function apply(ctx, config = {}) {
               `当前声音：${voiceLabel(pet.voice)}（${pet.voice || '未配置'}）`,
               `音量：${pet.volume}　语音播报开关：${pet.voiceEnabled ? '开' : '关'}`,
               `自动播报：${settings.auto ? '开' : '关'}${busy ? '（正在念）' : ''}`,
-              '念多长：不设段数上限，模型输出多少就念多少（按标点切句、段间按真实语速衔接）。',
+              '念多长：不设段数上限，模型输出多少就念多少，整段一次送给桌宠（超长才切块）。',
               '这套声音是桌宠自己的，想换就右击大肥鱼 → 设置 → 音色下拉里换，插件这边只有这一个声音。',
               '用法：/voice test 试听；/voice auto off 关自动播报。',
             ].join('\n'),
@@ -706,7 +826,7 @@ export function apply(ctx, config = {}) {
 
         if (arg.toLowerCase() === 'test') {
           try {
-            await doSpeak(`你好，我是大肥鱼，现在用的是${voiceLabel(pet.voice)}。`, PET_SPEECH_MAX_CHARS, 1)
+            await doSpeak(`你好，我是大肥鱼，现在用的是${voiceLabel(pet.voice)}。`, charLimit(), 1)
           } catch (error) {
             return { kind: 'error', text: `试听失败：${String(error?.message ?? error).split('\n')[0]}` }
           }

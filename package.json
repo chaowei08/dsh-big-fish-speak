@@ -1,7 +1,7 @@
 {
   "name": "dsh-big-fish-speak",
-  "version": "0.7.4",
-  "description": "让 dsh-pet 桌宠用它自己设置页里选的音色念模型输出，按标点切句、长文不设段数上限，合成失败只跳过该句。",
+  "version": "0.7.5",
+  "description": "让 dsh-pet 桌宠用它自己设置页里选的音色念模型输出：新版整段下发，旧版自动按 60 字切，合成失败只跳过该段。",
   "type": "module",
   "main": "./index.js",
   "license": "MIT",
