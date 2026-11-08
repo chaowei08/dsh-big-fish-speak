@@ -4,3 +4,5 @@ settings.json
 node_modules/
 package.json.bak-*
 _*_backup_*
+# 本地交接文档（含本机路径，不进公开仓库）
+交接说明.md
