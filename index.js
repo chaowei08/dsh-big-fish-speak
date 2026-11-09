@@ -59,6 +59,12 @@ const LEGACY_VERSION = '0.4.6'
 
 /** 运行时发现过"被截断"就锁定旧版行为，后面的长句不再白送一遍。 */
 let legacyCapDetected = false
+/** 取消标志：点关闭后设为 true，所有等待点都会检查并退出。 */
+let cancelRequested = false
+/** 中断时的续播位置：{ chunks, index }，再打开开关时从这里接着播。 */
+let pendingResume = null
+/** 保存用户原来的音量，静音时改成 0，恢复时改回去。 */
+let originalVolume = 1
 
 /** 读各 profile 里装的 dsh-pet 版本号；读不到返回空数组。 */
 function installedPetVersions() {
@@ -116,7 +122,7 @@ const MAX_HARD_CHUNKS = 200
  * dsh-pet 的 voice-cache 里 mp3 约 6KB/秒（48kbps），反推念白速度 ≈ 0.22 秒/字；
  * 这里取 0.23 秒/字并只留 0.5 秒自然换气，句子之间才不会空等十几秒。
  */
-const MS_PER_CHAR = 230
+const MS_PER_CHAR = 200
 const BETWEEN_GAP_MS = 500
 const MIN_GAP_MS = 1000
 
@@ -157,9 +163,12 @@ function readSettings() {
   try {
     parsed = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'))
   } catch {
-    return { auto: true }
+    return { auto: true, originalVolume: 1 }
   }
-  return { auto: parsed?.auto === undefined ? true : parsed.auto === true }
+  return {
+    auto: parsed?.auto === undefined ? true : parsed.auto === true,
+    originalVolume: typeof parsed?.originalVolume === 'number' ? parsed.originalVolume : 1,
+  }
 }
 
 /** 写设置；目录不可写时返回 false，由调用方回报，不抛异常。 */
@@ -329,6 +338,79 @@ function postJson(url, payload, timeoutMs = 20_000) {
   })
 }
 
+/** 设置桌宠音量（0-1，0 是静音），立刻生效，不需要重启。 */
+async function setPetVolume(ctx, volume) {
+  const origin = resolveOrigin(ctx)
+  if (!origin) return
+  try {
+    // 先 GET 完整配置，再修改 voiceVolume，再 PUT 回去
+    // （直接 PUT 只传 voiceVolume 会覆盖其他配置）
+    const configUrl = `${origin}${PET_SEGMENT}/config`
+    const parsed = new URL(configUrl)
+
+    // 1. GET 完整配置
+    const getConfig = await new Promise((resolve, reject) => {
+      const req = http.request(
+        {
+          protocol: parsed.protocol,
+          hostname: parsed.hostname,
+          port: parsed.port,
+          path: parsed.pathname,
+          method: 'GET',
+          timeout: 5000,
+        },
+        (res) => {
+          const chunks = []
+          res.on('data', (chunk) => chunks.push(chunk))
+          res.on('end', () => {
+            try {
+              const text = Buffer.concat(chunks).toString('utf8')
+              resolve(JSON.parse(text))
+            } catch (e) {
+              reject(e)
+            }
+          })
+        },
+      )
+      req.on('timeout', () => req.destroy(new Error('请求超时')))
+      req.on('error', reject)
+      req.end()
+    })
+
+    // 2. 修改 voiceVolume
+    const newConfig = { ...getConfig, voiceVolume: volume }
+
+    // 3. PUT 回去
+    const body = Buffer.from(JSON.stringify(newConfig), 'utf8')
+    await new Promise((resolve, reject) => {
+      const req = http.request(
+        {
+          protocol: parsed.protocol,
+          hostname: parsed.hostname,
+          port: parsed.port,
+          path: parsed.pathname,
+          method: 'PUT',
+          headers: {
+            'content-type': 'application/json; charset=utf-8',
+            'content-length': String(body.length),
+          },
+          timeout: 5000,
+        },
+        (res) => {
+          res.on('data', () => {})
+          res.on('end', resolve)
+        },
+      )
+      req.on('timeout', () => req.destroy(new Error('请求超时')))
+      req.on('error', reject)
+      req.write(body)
+      req.end()
+    })
+  } catch {
+    // 静音失败不影响主功能
+  }
+}
+
 /** 让大肥鱼念一句（同时显示气泡）。成功返回 true，失败抛错/返回原因。 */
 async function broadcast(ctx, text, opts = {}) {
   const pet = readPetConfig()
@@ -419,7 +501,7 @@ async function warmVoice(ctx, text) {
 function cutOne(text, limit) {
   if (text.length <= limit) return text
   const window = text.slice(0, limit)
-  const minAt = Math.floor(limit / 3)
+  const minAt = Math.floor(limit / 2) // 至少要一半字数以后才切，不要切太短
   const lastOf = (stops) => {
     let best = -1
     for (const stop of stops) {
@@ -543,6 +625,10 @@ async function waitSpeakVerdict(len, countBefore) {
   const truncateGraceMs = 2500
   let slicedAt = 0
   while (Date.now() < deadline) {
+    // 每轮都检查取消标志，关闭开关后立刻响应
+    if (cancelRequested) {
+      return { verdict: 'cancelled', heardChars: 0 }
+    }
     const fresh = speakRecords().slice(countBefore)
     const exact = fresh.find((record) => record.chars === len)
     if (exact !== undefined) {
@@ -567,26 +653,41 @@ async function waitSpeakVerdict(len, countBefore) {
  * broadcast 只代表"收到了"，Edge TTS 429 / 超时会只写一行 failed 就静默丢掉，
  * 所以这里比对日志，失败就退避重发，最多 VERIFY_ATTEMPTS 次。
  * 返回 { ok, truncated, heardChars, elapsed }：truncated 表示老版本桌宠只念了前 60 字。
+ * elapsed = 从发送到验证完成经过的时间（ms），用于扣掉下一段等待时间。
  */
 async function sendWithVerify(ctx, text) {
   const len = text.length
   for (let attempt = 0; attempt < VERIFY_ATTEMPTS; attempt += 1) {
     const countBefore = speakRecords().length
+    const sendStart = Date.now()
     await broadcastWithRetry(ctx, text)
     const { verdict, heardChars } = await waitSpeakVerdict(len, countBefore)
+    const elapsed = Date.now() - sendStart
     if (verdict === 'truncated') {
       // 记下来：后面的长句直接按 60 字切，不再白送一遍
       legacyCapDetected = true
-      return { ok: false, truncated: true, heardChars, elapsed: 0, attempt: attempt + 1 }
+      return { ok: false, truncated: true, heardChars, elapsed, attempt: attempt + 1 }
     }
     // 日志那一行写出时，这段音频刚好开始播：计时零点落在这里。
     // 若用"发送时刻"算已播时间，会把合成等待误算进去，下一段就会顶上来叠着念。
     if (verdict !== 'failed') {
-      return { ok: verdict === 'ok', truncated: false, heardChars: 0, elapsed: 0, attempt: attempt + 1 }
+      return { ok: verdict === 'ok', truncated: false, heardChars: 0, elapsed, attempt: attempt + 1 }
     }
     if (attempt < VERIFY_ATTEMPTS - 1) await sleep(VERIFY_RETRY_WAIT_MS * (attempt + 1))
   }
   return { ok: false, truncated: false, heardChars: 0, elapsed: 0, attempts: VERIFY_ATTEMPTS }
+}
+
+/** 可中断的 sleep：每 500ms 检查一次取消标志，点关闭后最多 500ms 内响应。 */
+async function cancellableSleep(ms) {
+  const step = 500
+  let elapsed = 0
+  while (elapsed < ms) {
+    if (cancelRequested) return
+    const wait = Math.min(step, ms - elapsed)
+    await sleep(wait)
+    elapsed += wait
+  }
 }
 
 /**
@@ -594,6 +695,7 @@ async function sendWithVerify(ctx, text) {
  * 每段先确认真的出声，再按"这段字数 × 实测语速 + 0.5 秒换气"扣掉已经花掉的合成时间，
  * 这样既不会空等十几秒，也不会两句叠在一起。
  * 单段彻底失败不中断整段朗读，记进 dropped 继续念下一句。
+ * 支持取消：cancelRequested=true 时立刻停止，记录 pendingResume 供后续续播。
  */
 async function runChunks(ctx, chunks, startIndex = 0, lead = null) {
   let spoken = 0
@@ -604,9 +706,15 @@ async function runChunks(ctx, chunks, startIndex = 0, lead = null) {
   if (lead && queue.length > 0) {
     void warmVoice(ctx, queue[0])
     const targetMs = Math.round(lead.chars * MS_PER_CHAR) + BETWEEN_GAP_MS
-    await sleep(Math.max(MIN_GAP_MS, targetMs - lead.elapsed))
+    await cancellableSleep(Math.max(MIN_GAP_MS, targetMs - lead.elapsed))
   }
   for (let i = 0; i < queue.length; i += 1) {
+    // 每段开始前检查取消标志
+    if (cancelRequested) {
+      // 记录续播位置：从当前段开始剩下的所有段
+      pendingResume = { chunks: queue.slice(i), index: 0 }
+      return { spoken, dropped, cancelled: true }
+    }
     let elapsed = 0
     const piece = queue[i]
     try {
@@ -625,21 +733,19 @@ async function runChunks(ctx, chunks, startIndex = 0, lead = null) {
       if (res.ok) spoken += 1
       else dropped.push(i + 1)
     } catch (error) {
-      const wrapped = new Error(
-        `第 ${i + 1}/${queue.length} 段没送出去：${String(error?.message ?? error).split('\n')[0]}`,
-      )
-      wrapped.spoken = spoken
-      wrapped.dropped = dropped
-      throw wrapped
+      // 单段失败不中断整体，记下来继续下一段
+      dropped.push(i + 1)
     }
     if (i < queue.length - 1) {
-      // 这段还在播的时候，先把下一段合成进缓存，下一段就能立刻接上
-      void warmVoice(ctx, queue[i + 1])
-      const targetMs = Math.round(piece.length * MS_PER_CHAR) + BETWEEN_GAP_MS
-      await sleep(Math.max(MIN_GAP_MS, targetMs - elapsed))
+      // 按字数估算这段要播多久，播完后再等0.6秒才发下一段（平衡速度和叠音）
+      // waitSpeakVerdict 返回时就是桌宠开始播报的时间，直接从这里开始算等待时间
+      const targetMs = Math.round(piece.length * MS_PER_CHAR) + 600
+      await cancellableSleep(Math.max(MIN_GAP_MS, targetMs))
     }
   }
-  return { spoken, dropped }
+  // 播完了，清掉续播记录
+  pendingResume = null
+  return { spoken, dropped, cancelled: false }
 }
 
 /**
@@ -677,6 +783,13 @@ export function apply(ctx, config = {}) {
       writeSettings(readSettings())
     }
 
+    // 重启 DSH 时自动还原成播报状态（开启）
+    const settings = readSettings()
+    originalVolume = settings.originalVolume ?? 1
+    writeSettings({ ...settings, auto: true })
+    // 恢复音量（上次关闭时可能改成了 0）
+    void setPetVolume(ctx, originalVolume)
+
     /** 正在念的时候不再叠新的，避免一句话没念完就被下一句打断。 */
     let busy = false
     /** 同一条消息只念一次（同一轮可能重复派发）。 */
@@ -694,10 +807,16 @@ export function apply(ctx, config = {}) {
     // ---- 自动播报：模型输出 ---------------------------------------------
     const eventDisposer = ctx.on('session/event', (session, event) => {
       try {
+        // 调试：打印所有事件类型
+        console.log(`[big-fish-speak] event type: ${event?.type}`)
+
         if (event?.type !== 'assistant/message') return
-        const settings = readSettings()
-        if (settings.auto !== true) return
-        if (busy) return
+        // 不管 auto 是 true 还是 false，都继续播报，只是音量不同
+        // auto = false 时是静音，auto = true 时是正常音量
+
+        // 新的模型输出来了，先取消当前播报，清掉旧的续播记录
+        cancelRequested = true
+        pendingResume = null
 
         const spoken = toSpeakable(assistantTextOf(event))
         if (spoken === '') return
@@ -716,9 +835,8 @@ export function apply(ctx, config = {}) {
         const messageId = String(
           event?.data?.message?.id ?? event?.data?.messageId ?? event?.seq ?? '',
         )
-        const key = `${sessionId}:${messageId}`
-        if (key !== ':' && key === lastSpokenKey) return
-        lastSpokenKey = key
+        // 开始播报新内容前，把取消标志改回 false
+        cancelRequested = false
 
         // 不 await：事件回调必须同步返回，念的过程在后台跑
         doSpeak(spoken, limit, autoChunks).catch(() => {
@@ -855,6 +973,89 @@ export function apply(ctx, config = {}) {
       },
     })
     if (typeof voiceDisposer === 'function') disposers.push(voiceDisposer)
+
+    // ---- Web UI 路由：顶部栏播报开关按钮 --------------------------------
+    // 顶部栏那个喇叭按钮通过这两个接口读状态、切开关：
+    //   GET  /plugins/dsh-big-fish-speak/status → { ok, auto, busy }
+    //   POST /plugins/dsh-big-fish-speak/auto   → body { auto: bool } → { ok, auto }
+    // busy 直接读上面闭包变量，所以路由必须注册在同一个 effect 里。
+    try {
+      const ws = ctx.webServer
+      if (ws !== undefined && typeof ws.register === 'function') {
+        const sendJson = (res, status, payload) => {
+          res.setHeader('Content-Type', 'application/json; charset=utf-8')
+          res.setHeader('Cache-Control', 'no-store')
+          res.statusCode = status
+          res.end(JSON.stringify(payload))
+        }
+
+        const statusRoute = ws.register({
+          kind: 'exact',
+          path: '/plugins/dsh-big-fish-speak/status',
+          handler: async (req, res) => {
+            if (req.method !== 'GET') {
+              res.setHeader('Allow', 'GET')
+              sendJson(res, 405, { ok: false, error: 'GET only' })
+              return
+            }
+            const settings = readSettings()
+            sendJson(res, 200, { ok: true, auto: settings.auto === true, busy })
+          },
+        })
+        if (typeof statusRoute === 'function') disposers.push(statusRoute)
+
+        const autoRoute = ws.register({
+          kind: 'exact',
+          path: '/plugins/dsh-big-fish-speak/auto',
+          handler: async (req, res) => {
+            if (req.method !== 'POST') {
+              res.setHeader('Allow', 'POST')
+              sendJson(res, 405, { ok: false, error: 'POST only' })
+              return
+            }
+            let body = ''
+            req.on('data', (chunk) => {
+              body += chunk
+              // 防超大 body 撑爆内存：超过 16KB 直接拒
+              if (body.length > 16_384) {
+                req.destroy()
+              }
+            })
+            req.on('end', () => {
+              try {
+                const parsed = JSON.parse(body || '{}')
+                const desired = parsed?.auto === true
+                const settings = readSettings()
+                // 关闭时：静音（音量改成 0），但播报流程继续走
+                // 开启时：恢复原来的音量
+                if (!desired) {
+                  // 先保存当前音量，再改成 0
+                  // 注意：只有当当前音量不是 0 的时候才更新 originalVolume
+                  // （如果已经是 0，说明是静音状态，不要把 0 保存成 originalVolume）
+                  const pet = readPetConfig()
+                  const currentVolume = pet.volume ?? 1
+                  if (currentVolume > 0) {
+                    originalVolume = currentVolume
+                  }
+                  writeSettings({ ...settings, auto: false, originalVolume })
+                  void setPetVolume(ctx, 0)
+                } else {
+                  writeSettings({ ...settings, auto: true, originalVolume })
+                  void setPetVolume(ctx, originalVolume)
+                }
+                sendJson(res, 200, { ok: true, auto: desired })
+              } catch {
+                sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
+              }
+            })
+          },
+        })
+        if (typeof autoRoute === 'function') disposers.push(autoRoute)
+      }
+    } catch (error) {
+      // webServer 不可用（桌面 profile 没有 web 界面）时静默跳过，
+      // 不影响命令行和自动播报功能。
+    }
 
     return () => {
       for (const dispose of disposers) {
