@@ -423,7 +423,13 @@ async function broadcast(ctx, text, opts = {}) {
   const url = `${origin}${PET_SEGMENT}/broadcast${query}`
   // 气泡时长按字数给，至少 10 秒，避免念到一半气泡先消失
   const duration = Math.max(10_000, Math.round(text.length * 320))
-  const { status, json } = await postJson(url, { text, duration: Math.min(duration, 120_000) })
+  // 桌宠的 /broadcast 默认只弹气泡、不出声（host/broadcast.ts 里判定是 speak === true），
+  // 不带这个字段就是"显示了但不念"。必须显式声明要出声。
+  const { status, json } = await postJson(url, {
+    text,
+    speak: true,
+    duration: Math.min(duration, 120_000),
+  })
   if (status !== 200) throw new Error(`桌宠接口返回 HTTP ${status}`)
   if (json?.ok !== true) {
     const reason = String(json?.reason ?? '')
